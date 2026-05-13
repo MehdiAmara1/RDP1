@@ -1,0 +1,129 @@
+name: High-Perf RDP via Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp-max:
+    runs-on: windows-latest          # ← Try this first (32 vCPU / 128 GB). If fails → change to windows-16-core or windows-8-core
+    # runs-on: windows-16-core        # fallback example
+    # runs-on: windows-8-core         # smaller but still better than default
+    # runs-on: windows-latest         # only if larger not available (4-core/16 GB)
+
+    timeout-minutes: 1440             # 24 hours max session - adjust down if needed (GitHub allows high values)
+
+    steps:
+      - name: Maximize Performance & Enable RDP
+        run: |
+          # Enable RDP + disable NLA/SecurityLayer for easy connect
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          # Firewall: Allow RDP from anywhere (Tailscale protects it)
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          # MAX PERFORMANCE: Ultimate/High Performance power plan
+          powercfg /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 | Out-Null  # Ultimate if exists
+          powercfg /setactive SCHEME_MIN   # High Performance minimum (fallback)
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  # High Performance
+
+          # Disable ALL visual effects for snappiest RDP
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" -Name "VisualFXSetting" -Value 3 -Force
+
+          # Disable heavy services/telemetry/indexing/Defender real-time (big perf win)
+          Set-Service -Name SysMain -StartupType Disabled -Status Stopped -ErrorAction SilentlyContinue
+          Set-Service -Name WSearch -StartupType Disabled -Status Stopped -ErrorAction SilentlyContinue
+          Set-Service -Name DiagTrack -StartupType Disabled -Status Stopped -ErrorAction SilentlyContinue
+          Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue  # Defender real-time off
+
+          # Restart RDP service
+          Restart-Service -Name TermService -Force
+
+          # Aggressive disk cleanup (frees GBs on runner SSD)
+          Remove-Item -Path "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "C:\Windows\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "C:\Windows\Prefetch\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "C:\Users\*\AppData\Local\Temp\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: Create Strong Random RDP User
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = [char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126)
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper   | Get-Random -Count 5
+          $rawPassword += $charSet.Lower   | Get-Random -Count 5
+          $rawPassword += $charSet.Number  | Get-Random -Count 5
+          $rawPassword += $charSet.Special | Get-Random -Count 5
+          $password = -join ($rawPassword | Sort-Object {Get-Random})
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser -Name "RDPUser" -Password $securePass -AccountNeverExpires -ErrorAction Stop
+          Add-LocalGroupMember -Group "Administrators" -Member "RDPUser"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDPUser"
+
+          echo "RDP_USERNAME=RDPUser" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"  # update version if newer
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installer
+          Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait
+          Remove-Item $installer -Force
+
+      - name: Connect to Tailscale
+        env:
+          AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $tsExe up --authkey=$AUTH_KEY --hostname="gh-rdp-max-$env:GITHUB_RUN_ID" --accept-routes
+
+          # Wait & get IP (up to 60s)
+          $tsIP = $null
+          $attempt = 0
+          while (!$tsIP -and $attempt -lt 12) {
+            $tsIP = & $tsExe ip -4
+            if ($tsIP) { break }
+            Start-Sleep -Seconds 5
+            $attempt++
+          }
+          if (!$tsIP) { Write-Error "No Tailscale IP after 60s"; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Port Open
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if (!$test.TcpTestSucceeded) {
+            Write-Error "RDP port 3389 not reachable on Tailscale IP"
+            exit 1
+          }
+          Write-Host "RDP port check OK!"
+
+      - name: Show RDP Credentials & Keep Alive
+        run: |
+          Write-Host "`n"
+          Write-Host "===== MAX PERFORMANCE RDP ACCESS =====" -ForegroundColor Green
+          Write-Host "Address   : $env:TAILSCALE_IP"
+          Write-Host "Username  : $env:RDP_USERNAME"
+          Write-Host "Password  : $env:RDP_PASSWORD"
+          Write-Host "======================================" -ForegroundColor Green
+          Write-Host "`nUse mstsc.exe or any RDP client. Disable animations/wallpaper in client for best speed."
+          Write-Host "Session will run up to 24 hours or until you cancel workflow."
+
+          # Keep alive with frequent status + basic disk/RAM monitor
+          while ($true) {
+            $date = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            $freeGB = [math]::Round(((Get-PSDrive C).Free / 1GB), 1)
+            $ramUsed = (Get-CimInstance Win32_OperatingSystem).TotalVisibleMemorySize / 1MB - (Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1MB
+            Write-Host "[$date] Active | Disk free: $freeGB GB | RAM used: $ramUsed GB | Ctrl+C to stop"
+            Start-Sleep -Seconds 120
+          }
